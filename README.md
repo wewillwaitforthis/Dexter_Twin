@@ -61,15 +61,14 @@ _Update this as folders are added._
 
 ### Setup
 ```bash
-git clone [repo URL]
-cd [repo folder]
-# [install steps go here]
+git clone https://github.com/wewillwaitforthis/Dexter_Twin.git
+cd [TBD]
+# [TBD]
 ```
 
 ### Running
 ```bash
-# [command to launch the simulation]
-# [command to start controller input]
+# [TBD]
 ```
 
 ## Design Decisions
