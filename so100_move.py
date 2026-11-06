@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive the MuJoCo Menagerie SO-100 arm from joint angles.
+"""Drive the MuJoCo Menagerie SO-100 arm from joint angles, with a cube to pick up.
 
 Joint order (matches the model's actuators):
     Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw
@@ -15,10 +15,18 @@ Waypoint mode: run fixed poses (no port needed).
     python so100_move.py --menagerie ~/mujoco_menagerie --angles 0 -45 90 0 0 30
     python so100_move.py ... --angles 0 -45 90 0 0 30 --angles 45 -90 60 20 0 0
     python so100_move.py ... --angles 0 -45 90 0 0 30 --video out.mp4
+
+Pick demo: scripted grasp-and-lift of the default cube.
+    python so100_move.py --menagerie ~/mujoco_menagerie --pick-demo
+    python so100_move.py ... --pick-demo --video pick.mp4
+
+The cube sits on the floor in front of the arm (--cube-pos X Y, --cube-size SIDE,
+or --no-cube). In the viewer, press Backspace to reset the simulation.
 """
 import argparse
 import contextlib
 import re
+import socket
 import threading
 import time
 from pathlib import Path
@@ -28,13 +36,60 @@ import numpy as np
 
 SETTLE_VEL = 1e-3      # rad/s: "arrived" once the arm has stopped moving
 MAX_SECONDS = 5.0      # give up on a waypoint after this much simulated time
+MIN_HOLD = 0.3         # seconds to hold each waypoint after the ramp, at least
+DEFAULT_RAMP = 1.0     # seconds to glide between waypoints
 VIEWER_HZ = 60         # live mode: window refresh / physics pacing
 
+# Cube: a 2.5 cm, 20 g box with high friction, 25 cm in front of the base.
+# The pick demo was solved for exactly these values.
+DEFAULT_CUBE_XY = (0.0, -0.25)
+DEFAULT_CUBE_SIDE = 0.025
+CUBE_MASS = 0.02
+CUBE_FRICTION = (1.5, 0.005, 0.0001)
 
-def load(menagerie: Path):
+# Scripted grasp for the default cube: (joint angles in degrees, ramp seconds).
+# These are the *commanded* angles. The actuators are plain P-controllers, so
+# they include a small gravity offset, which is why e.g. Pitch is not a round number.
+PICK_DEMO = [
+    ([-0.3, -119.3, 130.5, 58.0, 90.3, 51.6], 3.0),   # above/behind the cube, jaw open
+    ([-0.2,  -91.5, 134.5, 26.1, 90.2, 51.6], 1.5),   # slide jaws around the cube
+    ([-0.2,  -91.5, 134.5, 26.1, 90.2, -9.9], 0.8),  # close the jaw
+    ([-0.2, -108.2, 106.4, 71.0, 90.2, -9.9], 1.5),  # lift
+]
+
+PORT = 51234
+HOST = '100.82.127.15'
+
+
+
+def load(menagerie: Path, cube=None):
+    """Load the SO-100 scene. cube = (x, y, side_m) adds a free-floating box, or None."""
     xml = menagerie / "trs_so_arm100" / "scene.xml"
-    model = mujoco.MjModel.from_xml_path(str(xml))
+    spec = mujoco.MjSpec.from_file(str(xml))
+    if cube is not None:
+        x, y, side = cube
+        body = spec.worldbody.add_body(name="cube", pos=[x, y, side / 2])
+        body.add_freejoint()
+        body.add_geom(
+            name="cube", type=mujoco.mjtGeom.mjGEOM_BOX, size=[side / 2] * 3,
+            mass=CUBE_MASS, rgba=[0.9, 0.15, 0.1, 1], friction=list(CUBE_FRICTION),
+            condim=4,   # adds torsional friction so the cube doesn't spin in the grip
+        )
+    model = spec.compile()
     return model, mujoco.MjData(model)
+
+
+def has_cube(model):
+    return mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "cube") >= 0
+
+
+def cube_pos(model, data):
+    return data.body("cube").xpos.copy()
+
+
+def cube_lifted(model, data):
+    side = 2 * model.geom("cube").size[0]
+    return cube_pos(model, data)[2] > side / 2 + 0.02
 
 
 def joint_names(model):
@@ -63,39 +118,67 @@ def joint_angles(model, data):
 class AngleReader(threading.Thread):
     """Background thread: read lines from a serial port, keep the newest sample."""
 
-    def __init__(self, port, baud, n_joints=6):
+    def __init__(self, n_joints=6):
         super().__init__(daemon=True)
-        import serial  # pyserial
 
-        self._serial_exc = serial.SerialException
-        self.ser = serial.Serial(port, baud, timeout=0.1)
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        self.sock.bind((HOST,PORT))
+        self.sock.listen(5)
+        print(f"server is listening on {HOST}:{PORT}...")
         self.n = n_joints
         self._lock = threading.Lock()
-        self._latest = None        # newest valid sample (raw units)
-        self._seq = 0              # increments on every valid sample
+        self._latest = None
+        self._seq = 0
         self.bad_lines = 0
         self.error = None
         self._halt = threading.Event()
 
+
     def run(self):
+        self.sock.settimeout(1.0)  # so accept() can notice _halt
         while not self._halt.is_set():
             try:
-                raw = self.ser.readline()
-            except (self._serial_exc, OSError) as e:
-                self.error = e
-                return
-            if not raw:
+                conn, addr = self.sock.accept()
+            except socket.timeout:
                 continue
-            try:
-                parts = [p for p in re.split(r"[,\s;]+", raw.decode("ascii", "ignore").strip()) if p]
-                vals = np.array([float(p) for p in parts])
-                if vals.shape != (self.n,) or not np.all(np.isfinite(vals)):
-                    raise ValueError
-            except ValueError:
-                self.bad_lines += 1    # partial line at startup, noise, wrong field count...
-                continue
-            with self._lock:
-                self._latest, self._seq = vals, self._seq + 1
+            except OSError:
+                break  # socket was closed
+
+            print(f"Connected to {addr}")
+            with conn:
+                conn.settimeout(1.0)
+                data_buffer = bytearray()
+
+                while not self._halt.is_set():
+                    try:
+                        chunk = conn.recv(1024)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+
+                    if not chunk:  # client disconnected
+                        print(f"{addr} disconnected")
+                        break
+
+                    data_buffer.extend(chunk)
+
+                    while b'\n' in data_buffer:
+                        line, data_buffer = data_buffer.split(b'\n', 1)
+                        message = line.decode('utf-8', errors='replace').rstrip('\r')
+
+                        try:
+                            parts = [p for p in re.split(r"[,\s;]+", message) if p]
+                            vals = np.array([float(p) for p in parts])
+                            if vals.shape != (self.n,) or not np.all(np.isfinite(vals)):
+                                raise ValueError
+                        except ValueError:
+                            self.bad_lines += 1
+                            continue
+
+                        with self._lock:
+                            self._latest, self._seq = vals, self._seq + 1
 
     def get(self):
         with self._lock:
@@ -104,7 +187,7 @@ class AngleReader(threading.Thread):
     def close(self):
         self._halt.set()
         self.join(timeout=1)
-        self.ser.close()
+        self.sock.close()
 
 
 # --------------------------------------------------------------------------
@@ -127,7 +210,7 @@ def run_live(model, data, reader, radians, headless, duration):
     last_seq, got_first = 0, False
     last_report = last_warn = t_start = time.perf_counter()
     rx_count = 0
-    print(f"Listening on {reader.ser.port} @ {reader.ser.baudrate} baud "
+    print(f"Listening on {PORT}"
           f"({'radians' if radians else 'degrees'}). Ctrl+C to quit.")
 
     with cm as viewer:
@@ -165,9 +248,13 @@ def run_live(model, data, reader, radians, headless, duration):
                 if now - last_report >= 1.0:
                     rate = rx_count / (now - last_report)
                     ang = np.degrees(joint_angles(model, data))
+                    cube = ""
+                    if has_cube(model):
+                        cube = f" | cube z={cube_pos(model, data)[2] * 100:4.1f}cm" \
+                               + (" LIFTED" if cube_lifted(model, data) else "")
                     print(f"\r{rate:5.0f} Hz in | joints(deg): "
                           + " ".join(f"{a:+7.1f}" for a in ang)
-                          + f" | bad lines: {reader.bad_lines}   ", end="", flush=True)
+                          + f" | bad lines: {reader.bad_lines}{cube}   ", end="", flush=True)
                     last_report, rx_count = now, 0
 
                 # Pace physics to wall-clock time.
@@ -183,18 +270,30 @@ def run_live(model, data, reader, radians, headless, duration):
     report(model, data)
 
 
-def move_to(model, data, target, on_step=None):
-    """Set position targets and step physics until the arm settles (or times out)."""
-    data.ctrl[:] = clamp_to_limits(model, target)
-    steps = int(MAX_SECONDS / model.opt.timestep)
-    for _ in range(steps):
+def move_to(model, data, target, on_step=None, ramp=DEFAULT_RAMP):
+    """Glide the position targets to `target`, then step until the arm settles."""
+    goal = clamp_to_limits(model, target)
+    start = data.ctrl.copy()
+    dt = model.opt.timestep
+
+    # Smoothstep ramp: abrupt setpoint jumps whip the arm around and can knock the cube.
+    n_ramp = max(1, int(ramp / dt))
+    for i in range(n_ramp):
+        s = (i + 1) / n_ramp
+        data.ctrl[:] = start + (goal - start) * (s * s * (3 - 2 * s))
         mujoco.mj_step(model, data)
         if on_step:
             on_step()
-        # Settle on velocity, not position error: the actuators are plain
-        # P-controllers, so gravity leaves a few degrees of steady-state sag
-        # and the error never reaches zero.
-        if data.time > 0.2 and np.max(np.abs(data.qvel)) < SETTLE_VEL:
+
+    # Then hold until still. Settle on velocity, not position error: the actuators
+    # are plain P-controllers, so gravity leaves a few degrees of steady-state sag
+    # and the error never reaches zero.
+    data.ctrl[:] = goal
+    for i in range(int(MAX_SECONDS / dt)):
+        mujoco.mj_step(model, data)
+        if on_step:
+            on_step()
+        if i * dt > MIN_HOLD and np.max(np.abs(data.qvel)) < SETTLE_VEL:
             break
 
 
@@ -203,6 +302,10 @@ def report(model, data):
     angles = np.degrees(joint_angles(model, data))
     print("  joints (deg): " + ", ".join(f"{n}={a:+.1f}" for n, a in zip(joint_names(model), angles)))
     print(f"  Fixed_Jaw position (m): x={ee[0]:+.3f} y={ee[1]:+.3f} z={ee[2]:+.3f}")
+    if has_cube(model):
+        c = cube_pos(model, data)
+        state = "LIFTED" if cube_lifted(model, data) else "on the floor"
+        print(f"  cube position (m): x={c[0]:+.3f} y={c[1]:+.3f} z={c[2]:+.3f}  [{state}]")
 
 
 def run_viewer(model, data, waypoints):
@@ -218,11 +321,11 @@ def run_viewer(model, data, waypoints):
                 viewer.sync()
                 time.sleep(1 / 60)
 
-        for i, wp in enumerate(waypoints, 1):
+        for i, (wp, ramp) in enumerate(waypoints, 1):
             if not viewer.is_running():
                 return
             print(f"Waypoint {i}: {np.degrees(wp).round(1)} deg")
-            move_to(model, data, wp, on_step)
+            move_to(model, data, wp, on_step, ramp)
             report(model, data)
         while viewer.is_running():   # keep the window open at the end
             viewer.sync()
@@ -235,8 +338,8 @@ def run_video(model, data, waypoints, path, fps=30):
     renderer = mujoco.Renderer(model, height=480, width=640)
     cam = mujoco.MjvCamera()
     mujoco.mjv_defaultFreeCamera(model, cam)
-    cam.lookat[:] = [0, -0.2, 0.1]
-    cam.distance, cam.azimuth, cam.elevation = 0.9, 140, -25
+    cam.lookat[:] = [0, -0.25, 0.08]
+    cam.distance, cam.azimuth, cam.elevation = 0.8, 140, -25
     frames, next_t = [], 0.0
 
     def on_step():
@@ -246,9 +349,9 @@ def run_video(model, data, waypoints, path, fps=30):
             frames.append(renderer.render())
             next_t += 1 / fps
 
-    for i, wp in enumerate(waypoints, 1):
+    for i, (wp, ramp) in enumerate(waypoints, 1):
         print(f"Waypoint {i}: {np.degrees(wp).round(1)} deg")
-        move_to(model, data, wp, on_step)
+        move_to(model, data, wp, on_step, ramp)
         report(model, data)
     imageio.mimsave(path, frames, fps=fps)
     print(f"Wrote {path} ({len(frames)} frames)")
@@ -264,28 +367,51 @@ def main():
     p.add_argument("--angles", type=float, nargs=6, action="append",
                    metavar=("ROT", "PITCH", "ELBOW", "WR_PITCH", "WR_ROLL", "JAW"),
                    help="6 joint angles; repeat the flag for multiple waypoints (no port needed)")
+    p.add_argument("--ramp", type=float, default=DEFAULT_RAMP,
+                   help=f"waypoint mode: seconds to glide between waypoints (default {DEFAULT_RAMP})")
     p.add_argument("--radians", action="store_true", help="angles are radians (default: degrees)")
-    p.add_argument("--video", type=str, help="waypoint mode: render to this mp4 instead of opening a window")
+    p.add_argument("--video", type=str, help="waypoint/pick mode: render to this mp4 instead of opening a window")
+    p.add_argument("--pick-demo", action="store_true", help="run a scripted grasp-and-lift of the default cube")
+    p.add_argument("--no-cube", action="store_true", help="leave the cube out of the scene")
+    p.add_argument("--cube-pos", type=float, nargs=2, metavar=("X", "Y"), default=DEFAULT_CUBE_XY,
+                   help="cube centre on the floor, metres (default: %g %g; base is at 0 0, arm reaches toward -Y)"
+                        % DEFAULT_CUBE_XY)
+    p.add_argument("--cube-size", type=float, default=DEFAULT_CUBE_SIDE,
+                   help="cube side length in metres (default %g)" % DEFAULT_CUBE_SIDE)
     args = p.parse_args()
 
-    if bool(args.port) == bool(args.angles):
-        p.error("give exactly one of --port (live) or --angles (waypoints)")
+    if sum([bool(args.port), bool(args.angles), args.pick_demo]) != 1:
+        p.error("give exactly one of --port (live), --angles (waypoints) or --pick-demo")
 
-    model, data = load(args.menagerie)
+    cube = None
+    if not args.no_cube:
+        x, y = args.cube_pos
+        cube = (x, y, args.cube_size)
+        if args.pick_demo and (tuple(args.cube_pos) != DEFAULT_CUBE_XY or args.cube_size != DEFAULT_CUBE_SIDE):
+            print("note: --pick-demo only works for the default cube; ignoring --cube-pos/--cube-size")
+            cube = (*DEFAULT_CUBE_XY, DEFAULT_CUBE_SIDE)
+    elif args.pick_demo:
+        p.error("--pick-demo needs the cube; drop --no-cube")
+
+    model, data = load(args.menagerie, cube)
 
     if args.port:
-        reader = AngleReader(args.port, args.baud, model.nu)
+        reader = AngleReader()
         reader.start()
         try:
             run_live(model, data, reader, args.radians, args.no_viewer, args.duration)
         finally:
             reader.close()
+        return
+
+    if args.pick_demo:
+        waypoints = [(np.radians(a), r) for a, r in PICK_DEMO]
     else:
-        waypoints = [np.array(a) if args.radians else np.radians(a) for a in args.angles]
-        if args.video:
-            run_video(model, data, waypoints, args.video)
-        else:
-            run_viewer(model, data, waypoints)
+        waypoints = [(np.array(a) if args.radians else np.radians(a), args.ramp) for a in args.angles]
+    if args.video:
+        run_video(model, data, waypoints, args.video)
+    else:
+        run_viewer(model, data, waypoints)
 
 
 if __name__ == "__main__":
