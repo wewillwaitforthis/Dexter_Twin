@@ -4,13 +4,40 @@
     python send_test_angles.py /dev/ttyUSB1            # or one end of a virtual pair
 Virtual pair on Linux/macOS:  socat -d -d pty,raw,echo=0 pty,raw,echo=0
 """
-import math
-import sys
 import time
 
+import pygame
+pygame.init()
+pygame.joystick.init()
 import socket
 
-HOST = '100.82.127.15'
+if pygame.joystick.get_count() == 0:
+    print("No controller detected")
+    quit()
+else:
+    controller = pygame.joystick.Joystick(0)
+    print("Controller plugged into port 0 and operable")
+
+angles = [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    45.0
+]
+
+limits = [
+    (-180, 180),
+    (-90, 90),
+    (-90, 90),
+    (-90, 90),
+    (-180, 180),
+    (0, 90)
+]
+
+SPEED = 60 
+HOST = '127.0.0.1'
 PORT = 51234
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_sock:
@@ -18,14 +45,26 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_sock:
 
     t0 = time.time()
     while True:
+        pygame.event.pump()
         t = time.time() - t0
-        angles = [
-            60 * math.sin(0.5 * t),            # Rotation
-            -60 + 30 * math.sin(0.7 * t),      # Pitch
-            80 + 30 * math.sin(0.9 * t),       # Elbow
-            30 * math.sin(1.1 * t),            # Wrist_Pitch
-            40 * math.sin(1.3 * t),            # Wrist_Roll
-            40 + 40 * math.sin(1.5 * t),       # Jaw
+
+        controls = [
+            controller.get_axis(0),
+            -controller.get_axis(1),
+            -controller.get_axis(2),
+            controller.get_axis(3),
+            controller.get_button(5) - controller.get_button(4),
+            controller.get_button(0) - controller.get_button(1)
         ]
+
+        for joint, value in enumerate(controls):
+            if abs(value) > 0.12:
+                angles[joint] += value * SPEED * 0.2
+
+            low, high = limits[joint]
+            angles[joint] = max(low, min(high, angles[joint]))
+
+        print("Joint angles:", angles, flush=True)
+
         client_sock.sendall((", ".join(f"{a:.2f}" for a in angles) + "\n").encode())
         time.sleep(0.2)   # 50 Hz
