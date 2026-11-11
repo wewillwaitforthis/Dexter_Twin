@@ -4,14 +4,16 @@
 Joint order (matches the model's actuators):
     Rotation, Pitch, Elbow, Wrist_Pitch, Wrist_Roll, Jaw
 
-Live mode: continuously read angles from a serial port.
-    Each line is one sample: six numbers separated by commas or spaces,
-    newline-terminated, e.g.   0, -45, 90, 0, 0, 30
-    python so100_move.py --menagerie ~/mujoco_menagerie --port /dev/ttyUSB0
-    python so100_move.py ... --port /dev/ttyUSB0 --baud 115200 --radians
-    python so100_move.py ... --port /dev/ttyUSB0 --no-viewer --duration 10   # headless
+Live mode (default): run the HTTP server from angle_reader.py and apply the newest
+joint angles POSTed to /angles. Each request body is one JSON sample:
+    {"units": "degrees",
+     "angles": {"Rotation": 0, "Pitch": -45, "Elbow": 90,
+                "Wrist_Pitch": 0, "Wrist_Roll": 0, "Jaw": 30}}
+"units" is "degrees" or "radians" and applies to that sample.
+    python so100_move.py --menagerie ~/mujoco_menagerie
+    python so100_move.py --menagerie ~/mujoco_menagerie --no-viewer --duration 10   # headless
 
-Waypoint mode: run fixed poses (no port needed).
+Waypoint mode: run fixed poses (the server is not started).
     python so100_move.py --menagerie ~/mujoco_menagerie --angles 0 -45 90 0 0 30
     python so100_move.py ... --angles 0 -45 90 0 0 30 --angles 45 -90 60 20 0 0
     python so100_move.py ... --angles 0 -45 90 0 0 30 --video out.mp4
@@ -25,20 +27,22 @@ or --no-cube). In the viewer, press Backspace to reset the simulation.
 """
 import argparse
 import contextlib
-import re
-import socket
-import threading
 import time
 from pathlib import Path
 
 import mujoco
 import numpy as np
 
+from angle_reader import AngleReader, HOST, PORT
+
 SETTLE_VEL = 1e-3      # rad/s: "arrived" once the arm has stopped moving
 MAX_SECONDS = 5.0      # give up on a waypoint after this much simulated time
 MIN_HOLD = 0.3         # seconds to hold each waypoint after the ramp, at least
 DEFAULT_RAMP = 1.0     # seconds to glide between waypoints
 VIEWER_HZ = 60         # live mode: window refresh / physics pacing
+
+# Multiply a received angle by this to get radians.
+UNIT_TO_RAD = {"deg": np.pi / 180, "rad": 1.0}
 
 # Cube: a 2.5 cm, 20 g box with high friction, 25 cm in front of the base.
 # The pick demo was solved for exactly these values.
@@ -56,10 +60,6 @@ PICK_DEMO = [
     ([-0.2,  -91.5, 134.5, 26.1, 90.2, -9.9], 0.8),  # close the jaw
     ([-0.2, -108.2, 106.4, 71.0, 90.2, -9.9], 1.5),  # lift
 ]
-
-PORT = 51234
-HOST = '127.0.0.1'
-
 
 
 def load(menagerie: Path, cube=None):
@@ -112,89 +112,23 @@ def joint_angles(model, data):
     return data.qpos[model.jnt_qposadr[jids]].copy()
 
 
-# --------------------------------------------------------------------------
-# Serial input
-# --------------------------------------------------------------------------
-class AngleReader(threading.Thread):
-    """Background thread: read lines from a serial port, keep the newest sample."""
+def sample_to_target(sample, names):
+    """Convert one reader sample (a dict) to a target array in actuator order, in radians.
 
-    def __init__(self, n_joints=6):
-        super().__init__(daemon=True)
-
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-        self.sock.bind((HOST,PORT))
-        self.sock.listen(5)
-        print(f"server is listening on {HOST}:{PORT}...")
-        self.n = n_joints
-        self._lock = threading.Lock()
-        self._latest = None
-        self._seq = 0
-        self.bad_lines = 0
-        self.error = None
-        self._halt = threading.Event()
-
-
-    def run(self):
-        self.sock.settimeout(1.0)  # so accept() can notice _halt
-        while not self._halt.is_set():
-            try:
-                conn, addr = self.sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break  # socket was closed
-
-            print(f"Connected to {addr}")
-            with conn:
-                conn.settimeout(1.0)
-                data_buffer = bytearray()
-
-                while not self._halt.is_set():
-                    try:
-                        chunk = conn.recv(1024)
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        break
-
-                    if not chunk:  # client disconnected
-                        print(f"{addr} disconnected")
-                        break
-
-                    data_buffer.extend(chunk)
-
-                    while b'\n' in data_buffer:
-                        line, data_buffer = data_buffer.split(b'\n', 1)
-                        message = line.decode('utf-8', errors='replace').rstrip('\r')
-
-                        try:
-                            parts = [p for p in re.split(r"[,\s;]+", message) if p]
-                            vals = np.array([float(p) for p in parts])
-                            if vals.shape != (self.n,) or not np.all(np.isfinite(vals)):
-                                raise ValueError
-                        except ValueError:
-                            self.bad_lines += 1
-                            continue
-
-                        with self._lock:
-                            self._latest, self._seq = vals, self._seq + 1
-
-    def get(self):
-        with self._lock:
-            return self._seq, (None if self._latest is None else self._latest.copy())
-
-    def close(self):
-        self._halt.set()
-        self.join(timeout=1)
-        self.sock.close()
+    Looking angles up by name means the order of keys in the JSON doesn't matter;
+    the order of `names` (the model's actuators) decides the order of the array.
+    """
+    scale = UNIT_TO_RAD.get(sample["units"].lower())
+    if scale is None:
+        raise ValueError(f"unknown units {sample['units']!r} (expected 'degrees' or 'radians')")
+    return np.array([sample["angles"][n] for n in names], dtype=float) * scale
 
 
 # --------------------------------------------------------------------------
 # Modes
 # --------------------------------------------------------------------------
-def run_live(model, data, reader, radians, headless, duration):
-    """Apply the newest serial sample to the arm, in real time, until closed."""
+def run_live(model, data, reader, headless, duration):
+    """Apply the newest received sample to the arm, in real time, until closed."""
     import mujoco.viewer
 
     dt = model.opt.timestep
@@ -203,6 +137,11 @@ def run_live(model, data, reader, radians, headless, duration):
     names = joint_names(model)
     lo, hi = model.actuator_ctrlrange[:, 0], model.actuator_ctrlrange[:, 1]
 
+    # The reader validates samples against its own joint list. If that list doesn't
+    # match the model's actuators, every sample would fail the name lookup below.
+    if set(names) != set(reader.joints):
+        raise SystemExit(f"Joint name mismatch: model has {names}, reader expects {list(reader.joints)}")
+
     # Hold the current pose until the first sample arrives.
     data.ctrl[:] = clamp_to_limits(model, joint_angles(model, data), warn=False)
 
@@ -210,8 +149,8 @@ def run_live(model, data, reader, radians, headless, duration):
     last_seq, got_first = 0, False
     last_report = last_warn = t_start = time.perf_counter()
     rx_count = 0
-    print(f"Listening on {PORT}"
-          f"({'radians' if radians else 'degrees'}). Ctrl+C to quit.")
+    print(f"Listening on http://{HOST}:{PORT}/angles (units come from each message). "
+          "Ctrl+C to quit.")
 
     with cm as viewer:
         try:
@@ -220,25 +159,31 @@ def run_live(model, data, reader, radians, headless, duration):
                 now = time.perf_counter()
                 if duration and now - t_start >= duration:
                     break
-                if reader.error:
-                    print(f"\nSerial port error: {reader.error}. Holding last pose.")
-                    reader.error = None
+                if not reader.is_alive():
+                    print(f"\nInput server stopped: {reader.error or 'unknown reason'}. "
+                          "Holding last pose.")
                     break
 
                 seq, sample = reader.get()
                 if sample is not None and seq != last_seq:
                     rx_count += seq - last_seq
                     last_seq = seq
-                    target = sample if radians else np.radians(sample)
-                    clipped = np.clip(target, lo, hi)
-                    if np.any(clipped != target) and now - last_warn > 1.0:
-                        bad = [names[i] for i in np.flatnonzero(clipped != target)]
-                        print(f"\n  warning: out of range, clamped: {', '.join(bad)}")
-                        last_warn = now
-                    data.ctrl[:] = clipped
-                    if not got_first:
-                        print("Receiving data.")
-                        got_first = True
+                    try:
+                        target = sample_to_target(sample, names)
+                    except ValueError as e:
+                        if now - last_warn > 1.0:
+                            print(f"\n  warning: {e}; sample ignored")
+                            last_warn = now
+                    else:
+                        clipped = np.clip(target, lo, hi)
+                        if np.any(clipped != target) and now - last_warn > 1.0:
+                            bad = [names[i] for i in np.flatnonzero(clipped != target)]
+                            print(f"\n  warning: out of range, clamped: {', '.join(bad)}")
+                            last_warn = now
+                        data.ctrl[:] = clipped
+                        if not got_first:
+                            print("Receiving data.")
+                            got_first = True
 
                 for _ in range(steps_per_frame):
                     mujoco.mj_step(model, data)
@@ -254,7 +199,7 @@ def run_live(model, data, reader, radians, headless, duration):
                                + (" LIFTED" if cube_lifted(model, data) else "")
                     print(f"\r{rate:5.0f} Hz in | joints(deg): "
                           + " ".join(f"{a:+7.1f}" for a in ang)
-                          + f" | bad lines: {reader.bad_lines}{cube}   ", end="", flush=True)
+                          + f" | bad requests: {reader.bad_lines}{cube}   ", end="", flush=True)
                     last_report, rx_count = now, 0
 
                 # Pace physics to wall-clock time.
@@ -360,16 +305,15 @@ def run_video(model, data, waypoints, path, fps=30):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--menagerie", type=Path, required=True, help="path to mujoco_menagerie checkout")
-    p.add_argument("--port", help="serial port to read angles from, e.g. /dev/ttyUSB0 or COM3 (live mode)")
-    p.add_argument("--baud", type=int, default=115200, help="serial baud rate (default 115200)")
     p.add_argument("--no-viewer", action="store_true", help="live mode without a window (prints status only)")
     p.add_argument("--duration", type=float, help="live mode: stop after this many seconds")
     p.add_argument("--angles", type=float, nargs=6, action="append",
                    metavar=("ROT", "PITCH", "ELBOW", "WR_PITCH", "WR_ROLL", "JAW"),
-                   help="6 joint angles; repeat the flag for multiple waypoints (no port needed)")
+                   help="6 joint angles; repeat the flag for multiple waypoints (runs instead of live mode)")
     p.add_argument("--ramp", type=float, default=DEFAULT_RAMP,
                    help=f"waypoint mode: seconds to glide between waypoints (default {DEFAULT_RAMP})")
-    p.add_argument("--radians", action="store_true", help="angles are radians (default: degrees)")
+    p.add_argument("--radians", action="store_true",
+                   help="--angles values are radians (default: degrees). Live mode reads units from each message")
     p.add_argument("--video", type=str, help="waypoint/pick mode: render to this mp4 instead of opening a window")
     p.add_argument("--pick-demo", action="store_true", help="run a scripted grasp-and-lift of the default cube")
     p.add_argument("--no-cube", action="store_true", help="leave the cube out of the scene")
@@ -380,8 +324,11 @@ def main():
                    help="cube side length in metres (default %g)" % DEFAULT_CUBE_SIDE)
     args = p.parse_args()
 
-    if sum([bool(args.port), bool(args.angles), args.pick_demo]) != 1:
-        p.error("give exactly one of --port (live), --angles (waypoints) or --pick-demo")
+    if args.angles and args.pick_demo:
+        p.error("give at most one of --angles (waypoints) or --pick-demo; with neither, live mode runs")
+    live = not (args.angles or args.pick_demo)
+    if live and args.radians:
+        p.error("--radians only applies to --angles; live mode reads units from each message")
 
     cube = None
     if not args.no_cube:
@@ -395,11 +342,11 @@ def main():
 
     model, data = load(args.menagerie, cube)
 
-    if args.port:
+    if live:
         reader = AngleReader()
         reader.start()
         try:
-            run_live(model, data, reader, args.radians, args.no_viewer, args.duration)
+            run_live(model, data, reader, args.no_viewer, args.duration)
         finally:
             reader.close()
         return
