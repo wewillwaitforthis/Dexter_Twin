@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Send fake joint angles (degrees) over a serial port, to test so100_move.py.
- 
-    python send_test_angles.py /dev/ttyUSB1            # or one end of a virtual pair
-Virtual pair on Linux/macOS:  socat -d -d pty,raw,echo=0 pty,raw,echo=0
+"""Send joint angles to the AngleReader HTTP server (POST /angles).
+
+    python send_angles.py --once                  # send one pose and exit
+    python send_angles.py                         # smooth demo sweep at 30 Hz
+    python send_angles.py --rate 60 --duration 20
+    python send_angles.py --host 100.82.127.15 --port 51234
+    python send_angles.py --radians               # same motion, sent as radians
+
+Needs:  pip install requests
 """
-import time
-import sys
+import argparse
 import math
 from pathlib import Path
 import numpy as np
