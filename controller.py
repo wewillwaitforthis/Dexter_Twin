@@ -1,4 +1,8 @@
 import pygame
+from URDF.so100_ik import load_chain, fk, ik, to_menagerie_deg
+from pathlib import Path
+import numpy as np
+
 
 pygame.init()
 pygame.joystick.init()
@@ -10,59 +14,64 @@ else:
     controller = pygame.joystick.Joystick(0)
     print("Controller plugged into port 0 and operable")
 
-angles = {
-    "Rotation": 0.0,
-    "Pitch": 0.0,
-    "Elbow": 0.0,
-    "Wrist_Pitch": 0.0,
-    "Wrist_Roll": 0.0,
-    "Jaw": 45.0
-}
-
-limits = {
-    "Rotation": (-180, 180),
-    "Pitch": (-90, 90),
-    "Elbow": (-90, 90),
-    "Wrist_Pitch": (-90, 90),
-    "Wrist_Roll": (-180, 180),
-    "Jaw": (0, 90)
-}
-
-SPEED = 60  # degrees per second
+URDF = str(Path(__file__).resolve().parent / "URDF" / "so100_tcp.urdf")
+CLAW_SPEED = 90.0
+SPEED = 0.1
+DEADZONE = 0.1
+PITCH = None
 clock = pygame.time.Clock()
 
 def main():
+    chain = load_chain(URDF)
+    joints = {j["name"]: j for j in chain}
+    
+    q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
+         "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 0.0}
+    T, _ = fk(chain, q)
+    target = T[:3, 3].copy()        # start XYZ comes from FK, not (0, 0, 0)
+    claw = 90.0
+
+    x, y, z = 0.0, 0.0, 0.0
+    claw = 90.0 
+
     running = True
     while running:
         dt = clock.tick(60) / 1000
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-        controls = {
-            "Rotation": controller.get_axis(0),
-            "Pitch": -controller.get_axis(1),
-            "Elbow": -controller.get_axis(2),
-            "Wrist_Pitch": controller.get_axis(3),
-            "Wrist_Roll": controller.get_button(5) - controller.get_button(4),
-            "Jaw": controller.get_button(0) - controller.get_button(1)
-        }
+        delta = np.array([
+            deadzone(controller.get_axis(0)),
+            deadzone(-controller.get_axis(1)),
+            deadzone(-controller.get_axis(3)),
+        ]) * SPEED * dt
 
-        for joint, value in controls.items():
-            if abs(value) > 0.12:
-                angles[joint] += value * SPEED * dt
+        if delta.any():
+            new_target = target + delta
+            q_new, err, ok = ik(chain, new_target, q_init=q,
+                                pitch_deg=PITCH, seeds=1, iters=50)
+            if ok:
+                target, q = new_target, q_new
+            # else: out of reach, so keep the previous target and angles
 
-            low, high = limits[joint]
-            angles[joint] = max(low, min(high, angles[joint]))
+        # Triggers -> claw
+        if controller.get_axis(4) > 0.7:
+            claw = min(180.0, claw + CLAW_SPEED * dt)
+        if controller.get_axis(5) > 0.7:
+            claw = max(0.0, claw - CLAW_SPEED * dt)
+        g = joints.get("gripper")
+        if g:
+            q["gripper"] = g["lower"] + (claw / 180.0) * (g["upper"] - g["lower"])
+
+        send_to_sim(to_menagerie_deg(q))
 
 
-        print(
-        f"{angles['Rotation']:.2f} "
-        f"{angles['Pitch']:.2f} "
-        f"{angles['Elbow']:.2f} "
-        f"{angles['Wrist_Pitch']:.2f} "
-        f"{angles['Wrist_Roll']:.2f} "
-        f"{angles['Jaw']:.2f}"
-        )
+def deadzone(v):
+    return v if abs(v)>0.15 else 0.0
+
+def send_to_sim(angles):
+    return angles
+
 
 if __name__ == "__main__":
     main()

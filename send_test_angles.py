@@ -4,28 +4,92 @@
     python send_test_angles.py /dev/ttyUSB1            # or one end of a virtual pair
 Virtual pair on Linux/macOS:  socat -d -d pty,raw,echo=0 pty,raw,echo=0
 """
-import math
-import sys
 import time
-
+import sys
+import math
+from pathlib import Path
+import numpy as np
+import pygame
 import socket
 
-HOST = '100.82.127.15'
+pygame.init()
+pygame.joystick.init()
+
+if pygame.joystick.get_count() == 0:
+    print("No controller detected")
+    quit()
+else:
+    controller = pygame.joystick.Joystick(0)
+    print("Controller plugged into port 0 and operable")
+
+HERE = Path(__file__).resolve().parent                                  # NEW
+sys.path.append(str(HERE / "URDF"))  
+from so100_ik import load_chain, fk, ik, to_menagerie_deg   
+URDF = str(HERE / "URDF" / "so100_tcp.urdf")    
+
+angles = [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    45.0
+]
+
+limits = [
+    (-180, 180),
+    (-90, 90),
+    (-90, 90),
+    (-90, 90),
+    (-180, 180),
+    (0, 90)
+]
+
+SPEED = 60 
+XYZ_SPEED = 0.3
+DT = 0.02
+HOST = '127.0.0.1'
 PORT = 51234
+
+chain = load_chain(URDF)
+q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
+     "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 0.0}
+target = fk(chain, q)[0][:3, 3].copy()
+
+def dead(v):                                  
+    return v if abs(v) > 0.12 else 0.0
 
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_sock:
     client_sock.connect((HOST, PORT))
 
     t0 = time.time()
     while True:
+        pygame.event.pump()
         t = time.time() - t0
-        angles = [
-            60 * math.sin(0.5 * t),            # Rotation
-            -60 + 30 * math.sin(0.7 * t),      # Pitch
-            80 + 30 * math.sin(0.9 * t),       # Elbow
-            30 * math.sin(1.1 * t),            # Wrist_Pitch
-            40 * math.sin(1.3 * t),            # Wrist_Roll
-            40 + 40 * math.sin(1.5 * t),       # Jaw
-        ]
+
+        delta = np.array([
+            dead(controller.get_axis(0)),
+            dead(-controller.get_axis(1)),
+            dead(-controller.get_axis(3)),
+        ]) * XYZ_SPEED * DT
+
+        roll = angles[4] + (controller.get_button(5) - controller.get_button(4)) * SPEED * DT
+        claw = angles[5] + (controller.get_button(0) - controller.get_button(1)) * SPEED * DT
+        roll = max(limits[4][0], min(limits[4][1], roll))
+        claw = max(limits[5][0], min(limits[5][1], claw))
+        q["wrist_roll"] = math.radians(roll)
+
+        if delta.any():
+            new_target = target + delta
+            q_new, err, ok = ik(chain, new_target, q_init=q, seeds=1, iters=50)
+            if ok:
+                target, q = new_target, q_new
+
+        angles = to_menagerie_deg(q)
+        angles[4] = roll
+        angles[5] = claw
+
+        print("Joint angles:", angles, flush=True)
+
         client_sock.sendall((", ".join(f"{a:.2f}" for a in angles) + "\n").encode())
-        time.sleep(0.2)   # 50 Hz
+        time.sleep(DT)
