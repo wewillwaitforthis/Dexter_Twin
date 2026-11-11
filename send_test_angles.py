@@ -11,105 +11,94 @@ Needs:  pip install requests
 """
 import argparse
 import math
-import time
-
+from pathlib import Path
+import numpy as np
+import pygame
 import requests
+
+pygame.init()
+pygame.joystick.init()
+
+if pygame.joystick.get_count() == 0:
+    print("No controller detected")
+    quit()
+else:
+    controller = pygame.joystick.Joystick(0)
+    print("Controller plugged into port 0 and operable")
+
+HERE = Path(__file__).resolve().parent                                  # NEW
+sys.path.append(str(HERE / "URDF"))  
+from so100_ik import load_chain, fk, ik, to_menagerie_deg   
+URDF = str(HERE / "URDF" / "so100_tcp.urdf")
 
 JOINTS = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 
-# Demo motion, in degrees: each joint swings around a centre by +/- amplitude.
-# The centres are the example pose (0, -45, 90, 0, 0, 30); the amplitudes are
-# kept modest so the arm stays well inside its joint limits.
-CENTRE = {"Rotation": 0, "Pitch": -45, "Elbow": 90, "Wrist_Pitch": 0, "Wrist_Roll": 0, "Jaw": 30}
-AMPLITUDE = {"Rotation": 30, "Pitch": 20, "Elbow": 20, "Wrist_Pitch": 15, "Wrist_Roll": 20, "Jaw": 15}
-PERIOD = 8.0   # seconds per full swing
+angles = [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    45.0
+]
 
+limits = [
+    (-180, 180),
+    (-90, 90),
+    (-90, 90),
+    (-90, 90),
+    (-180, 180),
+    (0, 90)
+]
 
-def make_payload(angles_deg, radians=False):
-    """Build the JSON body the server expects, converting units if asked."""
-    if radians:
-        angles = {name: math.radians(v) for name, v in angles_deg.items()}
-        units = "radians"
-    else:
-        angles = dict(angles_deg)
-        units = "deg"
-    return {"units": units, "angles": angles}
+SPEED = 60 
+XYZ_SPEED = 0.3
+DT = 0.02
+HOST = '127.0.0.1'
+PORT = 51234
 
+chain = load_chain(URDF)
+q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
+     "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 0.0}
+target = fk(chain, q)[0][:3, 3].copy()
 
-def sweep_pose(t):
-    """Joint angles (degrees) at time t seconds. Joints are phase-shifted so they don't move in lockstep."""
-    w = 2 * math.pi / PERIOD
-    return {
-        name: CENTRE[name] + AMPLITUDE[name] * math.sin(w * t + i * math.pi / 3)
-        for i, name in enumerate(JOINTS)
-    }
+def dead(v):                                  
+    return v if abs(v) > 0.12 else 0.0
 
+t0 = time.time()
+while True:
+    pygame.event.pump()
+    t = time.time() - t0
 
-def send_once(session, url, payload):
-    r = session.post(url, json=payload, timeout=2)   # json= sets Content-Type and Content-Length
-    return r
+    delta = np.array([
+        dead(controller.get_axis(0)),
+        dead(-controller.get_axis(1)),
+        dead(-controller.get_axis(3)),
+    ]) * XYZ_SPEED * DT
 
+    roll = angles[4] + (controller.get_button(5) - controller.get_button(4)) * SPEED * DT
+    claw = angles[5] + (controller.get_button(0) - controller.get_button(1)) * SPEED * DT
+    roll = max(limits[4][0], min(limits[4][1], roll))
+    claw = max(limits[5][0], min(limits[5][1], claw))
+    q["wrist_roll"] = math.radians(roll)
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--host", default="localhost", help="server address (default localhost)")
-    p.add_argument("--port", type=int, default=8000, help="server port (default 8000)")
-    p.add_argument("--rate", type=float, default=30.0, help="messages per second (default 30)")
-    p.add_argument("--duration", type=float, help="stop after this many seconds (default: run until Ctrl+C)")
-    p.add_argument("--once", action="store_true", help="send the example pose one time and exit")
-    p.add_argument("--radians", action="store_true", help="send radians instead of degrees")
-    args = p.parse_args()
+    if delta.any():
+        new_target = target + delta
+        q_new, err, ok = ik(chain, new_target, q_init=q, seeds=1, iters=50)
+        if ok:
+            target, q = new_target, q_new
 
-    url = f"http://{args.host}:{args.port}/angles"
+    angles = to_menagerie_deg(q)
+    angles[4] = roll
+    angles[5] = claw
 
-    with requests.Session() as session:
-        if args.once:
-            payload = make_payload(CENTRE, args.radians)
-            try:
-                r = send_once(session, url, payload)
-            except requests.exceptions.RequestException as e:
-                raise SystemExit(f"could not reach {url}: {e}")
-            print(r.status_code, r.json())
-            return
+    print("Joint angles:", angles, flush=True)
 
-        print(f"Sending to {url} at {args.rate:g} Hz. Ctrl+C to stop.")
-        period = 1 / args.rate
-        t0 = next_send = time.perf_counter()
-        sent = failed = 0
-        try:
-            while True:
-                now = time.perf_counter()
-                if args.duration and now - t0 >= args.duration:
-                    break
+    data_json = {"units": "deg", "angles" : {}}
 
-                payload = make_payload(sweep_pose(now - t0), args.radians)
-                try:
-                    r = send_once(session, url, payload)
-                except requests.exceptions.RequestException as e:
-                    # Server not up yet, or it went away: report once per second and keep trying.
-                    print(f"\rcannot reach server ({type(e).__name__}); retrying...   ", end="", flush=True)
-                    time.sleep(1.0)
-                    next_send = time.perf_counter()
-                    continue
+    for i in angles:
+        data_json["angles"][JOINTS[i]] = angles[i]
 
-                if r.status_code == 200:
-                    sent += 1
-                else:
-                    failed += 1
-                    print(f"\nrejected: {r.status_code} {r.text.strip()}")
-                print(f"\rsent {sent}  rejected {failed}", end="", flush=True)
-
-                # Hold a steady rate by scheduling against a clock, not by sleeping a fixed amount.
-                next_send += period
-                delay = next_send - time.perf_counter()
-                if delay > 0:
-                    time.sleep(delay)
-                else:
-                    next_send = time.perf_counter()   # fell behind; don't try to catch up
-        except KeyboardInterrupt:
-            pass
-        print()
-
-
-if __name__ == "__main__":
-    main()
+    session = requests.Session()
+    session.post(f"http://{HOST}:{PORT}/angles", json=data_json, timeout=2)
+    time.sleep(DT)
