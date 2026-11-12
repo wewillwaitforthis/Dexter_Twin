@@ -3,7 +3,7 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HOST = "100.82.127.15"   # use "127.0.0.1" to accept local connections only
+HOST = "127.0.0.1"   # use "127.0.0.1" to accept local connections only
 PORT = 8000
 JOINTS = ("Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw")
 MAX_BODY = 4096
