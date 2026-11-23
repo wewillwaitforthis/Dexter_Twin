@@ -15,7 +15,7 @@ import numpy as np
 import requests
 import sys
 import time
-from controller import init, movement
+from handheld_controller import init, movement
 
 HERE = Path(__file__).resolve().parent                                  # NEW
 sys.path.append(str(HERE / "URDF"))  
