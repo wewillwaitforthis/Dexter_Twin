@@ -57,6 +57,7 @@ def main():
     q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
         "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 0.0}
     target = fk(chain, q)[0][:3, 3].copy()
+    
 
 
     while True:
