@@ -3,6 +3,7 @@ import pygame
 
 CLAW_SPEED = 60
 XYZ_SPEED = 0.3
+PITCH_SPEED = 30
 
 def dz(v):
     #deadzone                            
@@ -28,4 +29,5 @@ def movement(controller, dt):
     left_trigger = (controller.get_axis(4) + 1) / 2
     right_trigger = (controller.get_axis(5) + 1) / 2
     dclaw = (left_trigger - right_trigger) * CLAW_SPEED * dt
-    return dxyz, droll, dclaw
+    dpitch = (controller.get_button(1) - controller.get_button(0)) * PITCH_SPEED * dt
+    return dxyz, droll, dclaw, dpitch

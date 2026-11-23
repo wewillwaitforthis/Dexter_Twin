@@ -57,13 +57,14 @@ def main():
     q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
         "wrist_flex": 0.0, "wrist_roll": 0.0, "gripper": 0.0}
     target = fk(chain, q)[0][:3, 3].copy()
-    
+    pitch_adjust = 0.0
 
 
     while True:
-        dxyz, droll, dclaw = movement(c, DT)
+        dxyz, droll, dclaw, dpitch = movement(c, DT)
         delta = np.array(dxyz)
 
+        pitch_adjust += dpitch
         roll = max(limits[4][0], min(limits[4][1], angles[4] + droll))
         claw = max(limits[5][0], min(limits[5][1], angles[5] + dclaw))
         q["wrist_roll"] = math.radians(roll)
@@ -75,6 +76,7 @@ def main():
                 target, q = new_target, q_new      
 
         angles = to_menagerie_deg(q)
+        angles[3] = max(limits[3][0], min(limits[3][1], angles[3] + pitch_adjust))
         angles[4] = roll
         angles[5] = claw      
 
