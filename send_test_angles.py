@@ -15,6 +15,8 @@ from pathlib import Path
 import numpy as np
 import pygame
 import requests
+import sys
+import time
 
 pygame.init()
 pygame.joystick.init()
@@ -55,7 +57,7 @@ SPEED = 60
 XYZ_SPEED = 0.3
 DT = 0.02
 HOST = '127.0.0.1'
-PORT = 51234
+PORT = 8000
 
 chain = load_chain(URDF)
 q = {"shoulder_pan": 0.0, "shoulder_lift": 1.5, "elbow_flex": -1.5,
@@ -96,7 +98,7 @@ while True:
 
     data_json = {"units": "deg", "angles" : {}}
 
-    for i in angles:
+    for i in range(len(angles)):
         data_json["angles"][JOINTS[i]] = angles[i]
 
     session = requests.Session()
