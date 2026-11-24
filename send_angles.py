@@ -15,9 +15,9 @@ import numpy as np
 import requests
 import sys
 import time
-from handheld_controller import init, movement
+from vr_controller import init, movement
 
-HERE = Path(__file__).resolve().parent                                  # NEW
+HERE = Path(__file__).resolve().parent
 sys.path.append(str(HERE / "URDF"))  
 from so100_ik import load_chain, fk, ik, to_menagerie_deg   
 URDF = str(HERE / "URDF" / "so100_tcp.urdf")
@@ -69,11 +69,15 @@ def main():
         claw = max(limits[5][0], min(limits[5][1], angles[5] + dclaw))
         q["wrist_roll"] = math.radians(roll)
 
+        r = c.get("right")
+        print("grip:", r and r["grip"], "dxyz:", dxyz, flush=True)
+
         if delta.any():
             new_target = target + delta
             q_new, err, ok = ik(chain, new_target, q_init=q, seeds=1, iters=50)
+            print("ik ok:", ok, "err:", err, flush=True)
             if ok:
-                target, q = new_target, q_new      
+                target, q = new_target, q_new
 
         angles = to_menagerie_deg(q)
         angles[3] = max(limits[3][0], min(limits[3][1], angles[3] + pitch_adjust))

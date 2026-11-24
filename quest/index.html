@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<button id="go" style="font-size:40px;padding:30px">Start passthrough</button>
+<script>
+const ws = new WebSocket(`ws://${location.hostname}:8765`);
+
+document.getElementById("go").onclick = async () => {
+  const session = await navigator.xr.requestSession("immersive-ar");
+  const gl = document.createElement("canvas").getContext("webgl", {xrCompatible: true, alpha: true});
+  session.updateRenderState({baseLayer: new XRWebGLLayer(session, gl)});
+  const space = await session.requestReferenceSpace("local");
+
+  session.requestAnimationFrame(function loop(t, frame) {
+    session.requestAnimationFrame(loop);
+
+    // keep the display fully transparent so you only see passthrough
+    const layer = session.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+    const out = {};
+    for (const src of session.inputSources) {
+      const pose = frame.getPose(src.gripSpace, space);
+      const gp = src.gamepad;
+      if (!pose || !gp) continue;
+      const p = pose.transform.position;
+      out[src.handedness] = {
+        pos: [p.x, p.y, p.z],
+        grip: gp.buttons[1].pressed,
+        stick_x: gp.axes[2] || 0,
+        a: gp.buttons[4]?.pressed ? 1 : 0,
+        b: gp.buttons[5]?.pressed ? 1 : 0,
+      };
+    }
+    if (ws.readyState === 1) ws.send(JSON.stringify(out));
+  });
+};
+</script>
