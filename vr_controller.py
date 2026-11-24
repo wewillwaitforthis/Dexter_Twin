@@ -9,7 +9,7 @@ prev_pos = None
 def change_axis(p):
     # xr system x: right y:up z:towards user 
     # mujoco x:forward y:left z:up
-    return np.array([-p[2], -p[0], p[1]])
+    return np.array([-p[0], p[2], p[1]])
 
 def init():
     quest_server.start()
