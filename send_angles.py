@@ -69,9 +69,6 @@ def main():
         claw = max(limits[5][0], min(limits[5][1], angles[5] + dclaw))
         q["wrist_roll"] = math.radians(roll)
 
-        r = c.get("right")
-        print("grip:", r and r["grip"], "dxyz:", dxyz, flush=True)
-
         if delta.any():
             new_target = target + delta
             q_new, err, ok = ik(chain, new_target, q_init=q, seeds=1, iters=50)
